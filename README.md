@@ -59,6 +59,14 @@ membrane state <id>            Query container state (JSON)
 membrane kill <id> [signal]    Send signal to container
 membrane delete <id>           Clean up container
 membrane list                  List all containers
+membrane spec                  Generate default config.json
+membrane version               Print version info
+```
+
+### Global Flags
+
+```
+--root <path>    State directory (default: /run/membrane)
 ```
 
 ## Requirements
@@ -87,6 +95,30 @@ All the magic happens in about 2000 lines of Go.
 - Run on Windows/macOS
 - Checkpoint/restore
 - Rootless mode (requires root for v0.1.0)
+
+## Architecture
+
+```
+membrane/
+├── cmd/membrane/       CLI entry point
+├── internal/
+│   ├── container/      Container lifecycle (create, start, kill)
+│   ├── namespace/      Linux namespace setup
+│   ├── cgroup/         Cgroups v2 resource limits
+│   ├── filesystem/     Mount operations, pivot_root
+│   ├── seccomp/        Syscall filtering
+│   ├── spec/           OCI spec parsing
+│   └── state/          Container state persistence
+└── pkg/oci/            OCI type definitions
+```
+
+## Testing
+
+```bash
+go test ./...           # Run all tests
+go test -v ./...        # Verbose output
+go vet ./...            # Static analysis
+```
 
 ## License
 
