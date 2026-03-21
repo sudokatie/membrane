@@ -1,5 +1,5 @@
 # Binaries
-membrane
+/membrane
 *.exe
 
 # Test artifacts
