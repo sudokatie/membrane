@@ -1,0 +1,19 @@
+# Binaries
+membrane
+*.exe
+
+# Test artifacts
+*.test
+coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Build
+/bin/
+/dist/
