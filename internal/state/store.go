@@ -30,6 +30,8 @@ type Store interface {
 	List() ([]*State, error)
 	// Exists returns true if a container exists.
 	Exists(id string) bool
+	// Create creates a new container state (fails if exists).
+	Create(state *State) error
 }
 
 // FileStore stores container state in the filesystem.
