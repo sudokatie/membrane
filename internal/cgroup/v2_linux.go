@@ -100,6 +100,17 @@ func (m *V2Manager) SetResources(resources *Resources) error {
 		}
 	}
 
+	// memory.high (soft limit - triggers reclaim pressure)
+	if resources.MemoryHigh > 0 {
+		if err := m.writeFile("memory.high", strconv.FormatInt(resources.MemoryHigh, 10)); err != nil {
+			// Ignore error - memory controller may not be enabled
+		}
+	} else if resources.MemoryHigh == -1 {
+		if err := m.writeFile("memory.high", "max"); err != nil {
+			// Ignore error
+		}
+	}
+
 	if resources.MemorySwapLimit > 0 {
 		if err := m.writeFile("memory.swap.max", strconv.FormatInt(resources.MemorySwapLimit, 10)); err != nil {
 			// Ignore error - swap controller may not be enabled
@@ -168,6 +179,52 @@ func (m *V2Manager) SetResources(resources *Resources) error {
 		}
 	}
 
+	// IO throttle limits (io.max)
+	// Format: "MAJ:MIN rbps=BYTES wbps=BYTES riops=IOPS wiops=IOPS"
+	if err := m.setIOMax(resources); err != nil {
+		// Ignore error - io controller may not be enabled
+	}
+
+	return nil
+}
+
+// setIOMax sets IO throttle limits via io.max.
+func (m *V2Manager) setIOMax(resources *Resources) error {
+	// Build io.max entries per device
+	deviceLimits := make(map[string][]string)
+
+	// Add read BPS limits
+	for _, d := range resources.IOReadBPS {
+		key := fmt.Sprintf("%d:%d", d.Major, d.Minor)
+		deviceLimits[key] = append(deviceLimits[key], fmt.Sprintf("rbps=%d", d.Rate))
+	}
+
+	// Add write BPS limits
+	for _, d := range resources.IOWriteBPS {
+		key := fmt.Sprintf("%d:%d", d.Major, d.Minor)
+		deviceLimits[key] = append(deviceLimits[key], fmt.Sprintf("wbps=%d", d.Rate))
+	}
+
+	// Add read IOPS limits
+	for _, d := range resources.IOReadIOPS {
+		key := fmt.Sprintf("%d:%d", d.Major, d.Minor)
+		deviceLimits[key] = append(deviceLimits[key], fmt.Sprintf("riops=%d", d.Rate))
+	}
+
+	// Add write IOPS limits
+	for _, d := range resources.IOWriteIOPS {
+		key := fmt.Sprintf("%d:%d", d.Major, d.Minor)
+		deviceLimits[key] = append(deviceLimits[key], fmt.Sprintf("wiops=%d", d.Rate))
+	}
+
+	// Write each device's limits
+	for device, limits := range deviceLimits {
+		line := device + " " + strings.Join(limits, " ")
+		if err := m.writeFile("io.max", line); err != nil {
+			return fmt.Errorf("set io.max for %s: %w", device, err)
+		}
+	}
+
 	return nil
 }
 
@@ -175,15 +232,25 @@ func (m *V2Manager) SetResources(resources *Resources) error {
 func (m *V2Manager) GetResources() (*Resources, error) {
 	r := &Resources{
 		MemoryLimit: -1,
+		MemoryHigh:  -1,
 		CPUQuota:    -1,
 		PidsLimit:   -1,
 	}
 
-	// Memory
+	// Memory max
 	if data, err := m.readFile("memory.max"); err == nil {
 		if data != "max" {
 			if val, err := strconv.ParseInt(data, 10, 64); err == nil {
 				r.MemoryLimit = val
+			}
+		}
+	}
+
+	// Memory high
+	if data, err := m.readFile("memory.high"); err == nil {
+		if data != "max" {
+			if val, err := strconv.ParseInt(data, 10, 64); err == nil {
+				r.MemoryHigh = val
 			}
 		}
 	}
