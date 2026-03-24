@@ -57,6 +57,21 @@ func (m *Manager) Start(opts *StartOptions) error {
 	}
 	nsConfig.SortForClone()
 
+	// Set up terminal if requested
+	var terminal *Terminal
+	if containerSpec.Process != nil && containerSpec.Process.Terminal {
+		var err error
+		terminal, err = NewTerminal()
+		if err != nil {
+			return fmt.Errorf("create terminal: %w", err)
+		}
+		defer func() {
+			if terminal != nil {
+				terminal.Close()
+			}
+		}()
+	}
+
 	// Fork child process
 	pid, err := namespace.CloneChild(nsConfig)
 	if err != nil {
@@ -65,7 +80,7 @@ func (m *Manager) Start(opts *StartOptions) error {
 
 	if pid == 0 {
 		// In child process
-		if err := m.initChild(containerSpec, st.Bundle); err != nil {
+		if err := m.initChild(containerSpec, st.Bundle, terminal); err != nil {
 			fmt.Fprintf(os.Stderr, "init error: %v\n", err)
 			os.Exit(1)
 		}
@@ -91,11 +106,25 @@ func (m *Manager) Start(opts *StartOptions) error {
 }
 
 // initChild runs in the child process after fork.
-func (m *Manager) initChild(containerSpec *oci.Spec, bundle string) error {
+func (m *Manager) initChild(containerSpec *oci.Spec, bundle string, terminal *Terminal) error {
+	// Set up terminal if provided
+	if terminal != nil {
+		if err := terminal.SetupChildTerminal(); err != nil {
+			return fmt.Errorf("setup terminal: %w", err)
+		}
+	}
+
 	// Set up hostname
 	if containerSpec.Hostname != "" {
 		if err := namespace.SetHostname(containerSpec.Hostname); err != nil {
 			return fmt.Errorf("set hostname: %w", err)
+		}
+	}
+
+	// Apply sysctl settings (must be done before pivot_root in some cases)
+	if containerSpec.Linux != nil && len(containerSpec.Linux.Sysctl) > 0 {
+		if err := applySysctls(containerSpec.Linux.Sysctl); err != nil {
+			return fmt.Errorf("apply sysctls: %w", err)
 		}
 	}
 
@@ -115,6 +144,13 @@ func (m *Manager) initChild(containerSpec *oci.Spec, bundle string) error {
 	// Set up filesystem and pivot_root
 	if err := filesystem.SetupRootfs(rootfs, mounts); err != nil {
 		return fmt.Errorf("setup rootfs: %w", err)
+	}
+
+	// Apply root readonly if specified
+	if containerSpec.Root != nil && containerSpec.Root.Readonly {
+		if err := filesystem.ReadonlyPath("/"); err != nil {
+			return fmt.Errorf("make root readonly: %w", err)
+		}
 	}
 
 	// Apply masked paths
@@ -138,10 +174,31 @@ func (m *Manager) initChild(containerSpec *oci.Spec, bundle string) error {
 		}
 	}
 
+	// Apply rlimits
+	if containerSpec.Process != nil && len(containerSpec.Process.Rlimits) > 0 {
+		if err := applyRlimits(containerSpec.Process.Rlimits); err != nil {
+			return fmt.Errorf("apply rlimits: %w", err)
+		}
+	}
+
 	// Set no_new_privs if requested
 	if containerSpec.Process != nil && containerSpec.Process.NoNewPrivileges {
 		if err := capabilities.SetNoNewPrivs(); err != nil {
 			return fmt.Errorf("set no_new_privs: %w", err)
+		}
+	}
+
+	// Apply AppArmor profile
+	if containerSpec.Process != nil && containerSpec.Process.ApparmorProfile != "" {
+		if err := applyAppArmorProfile(containerSpec.Process.ApparmorProfile); err != nil {
+			return fmt.Errorf("apply apparmor profile: %w", err)
+		}
+	}
+
+	// Apply SELinux label
+	if containerSpec.Process != nil && containerSpec.Process.SelinuxLabel != "" {
+		if err := applySELinuxLabel(containerSpec.Process.SelinuxLabel); err != nil {
+			return fmt.Errorf("apply selinux label: %w", err)
 		}
 	}
 
@@ -153,7 +210,7 @@ func (m *Manager) initChild(containerSpec *oci.Spec, bundle string) error {
 		}
 	}
 
-	// Apply seccomp filter
+	// Apply seccomp filter (must be last before exec)
 	if containerSpec.Linux != nil && containerSpec.Linux.Seccomp != nil {
 		profile := seccomp.FromSpec(containerSpec.Linux.Seccomp)
 		if err := seccomp.LoadFilter(profile); err != nil {
@@ -209,7 +266,6 @@ func createDevice(dev oci.LinuxDevice) error {
 	}
 
 	// Create the device using mknod
-	// This is handled in the Linux-specific code
 	return createDeviceNode(dev.Path, mode, dev.Major, dev.Minor, dev.UID, dev.GID)
 }
 
