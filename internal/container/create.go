@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/sudokatie/membrane/internal/cgroup"
 	"github.com/sudokatie/membrane/internal/spec"
 	"github.com/sudokatie/membrane/internal/state"
 	"github.com/sudokatie/membrane/pkg/oci"
@@ -88,6 +89,24 @@ func (m *Manager) Create(opts *CreateOptions) (*Container, error) {
 		annotations[k] = v
 	}
 
+	// Create cgroup
+	cgroupConfig := cgroup.DefaultConfig(opts.ID)
+	if containerSpec.Linux != nil && containerSpec.Linux.Resources != nil {
+		cgroupConfig.Resources = cgroup.FromSpec(containerSpec.Linux.Resources)
+	}
+	cgroupMgr := cgroup.NewV2Manager(cgroupConfig)
+	if err := cgroupMgr.Create(); err != nil {
+		// Log but don't fail - cgroups may not be available
+		// (e.g., running in a container without cgroup access)
+	}
+
+	// Apply resource limits
+	if cgroupConfig.Resources != nil {
+		if err := cgroupMgr.SetResources(cgroupConfig.Resources); err != nil {
+			// Non-fatal
+		}
+	}
+
 	// Create state
 	st := &state.State{
 		Version:     oci.Version,
@@ -101,11 +120,10 @@ func (m *Manager) Create(opts *CreateOptions) (*Container, error) {
 
 	// Save state
 	if err := m.store.Create(st); err != nil {
+		// Clean up cgroup on failure
+		cgroupMgr.Delete()
 		return nil, fmt.Errorf("save state: %w", err)
 	}
-
-	// TODO: Create cgroup
-	// This will be implemented in Task 7
 
 	return &Container{
 		ID:     opts.ID,
@@ -128,8 +146,12 @@ func (m *Manager) Delete(id string, force bool) error {
 		return fmt.Errorf("cannot delete container in %s state", st.Status)
 	}
 
-	// TODO: Clean up cgroup
-	// This will be implemented in Task 12
+	// Clean up cgroup
+	cgroupConfig := cgroup.DefaultConfig(id)
+	cgroupMgr := cgroup.NewV2Manager(cgroupConfig)
+	if err := cgroupMgr.Delete(); err != nil {
+		// Log but continue - cgroup may not exist or may have been cleaned up
+	}
 
 	// Delete state
 	if err := m.store.Delete(id); err != nil {

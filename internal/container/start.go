@@ -5,8 +5,11 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/sudokatie/membrane/internal/capabilities"
 	"github.com/sudokatie/membrane/internal/cgroup"
+	"github.com/sudokatie/membrane/internal/filesystem"
 	"github.com/sudokatie/membrane/internal/namespace"
+	"github.com/sudokatie/membrane/internal/seccomp"
 	"github.com/sudokatie/membrane/internal/spec"
 	"github.com/sudokatie/membrane/internal/state"
 	"github.com/sudokatie/membrane/pkg/oci"
@@ -102,8 +105,61 @@ func (m *Manager) initChild(containerSpec *oci.Spec, bundle string) error {
 		rootfs = filepath.Join(bundle, rootfs)
 	}
 
+	// Build mount list from spec
+	mounts := filesystem.DefaultMounts()
+	if containerSpec.Mounts != nil {
+		specMounts := filesystem.FromSpec(containerSpec, bundle)
+		mounts = append(mounts, specMounts.Mounts...)
+	}
+
 	// Set up filesystem and pivot_root
-	// This is done in the filesystem package
+	if err := filesystem.SetupRootfs(rootfs, mounts); err != nil {
+		return fmt.Errorf("setup rootfs: %w", err)
+	}
+
+	// Apply masked paths
+	if containerSpec.Linux != nil && len(containerSpec.Linux.MaskedPaths) > 0 {
+		if err := filesystem.MaskPaths(containerSpec.Linux.MaskedPaths); err != nil {
+			return fmt.Errorf("mask paths: %w", err)
+		}
+	}
+
+	// Apply readonly paths
+	if containerSpec.Linux != nil && len(containerSpec.Linux.ReadonlyPaths) > 0 {
+		if err := filesystem.ReadonlyPaths(containerSpec.Linux.ReadonlyPaths); err != nil {
+			return fmt.Errorf("readonly paths: %w", err)
+		}
+	}
+
+	// Create devices from spec
+	if containerSpec.Linux != nil && len(containerSpec.Linux.Devices) > 0 {
+		if err := createDevicesFromSpec(containerSpec.Linux.Devices); err != nil {
+			return fmt.Errorf("create devices: %w", err)
+		}
+	}
+
+	// Set no_new_privs if requested
+	if containerSpec.Process != nil && containerSpec.Process.NoNewPrivileges {
+		if err := capabilities.SetNoNewPrivs(); err != nil {
+			return fmt.Errorf("set no_new_privs: %w", err)
+		}
+	}
+
+	// Apply capabilities
+	if containerSpec.Process != nil && containerSpec.Process.Capabilities != nil {
+		capConfig := capabilities.FromSpec(containerSpec.Process.Capabilities)
+		if err := capabilities.Apply(capConfig); err != nil {
+			return fmt.Errorf("apply capabilities: %w", err)
+		}
+	}
+
+	// Apply seccomp filter
+	if containerSpec.Linux != nil && containerSpec.Linux.Seccomp != nil {
+		profile := seccomp.FromSpec(containerSpec.Linux.Seccomp)
+		if err := seccomp.LoadFilter(profile); err != nil {
+			return fmt.Errorf("load seccomp filter: %w", err)
+		}
+	}
 
 	// Change to working directory
 	if containerSpec.Process != nil && containerSpec.Process.Cwd != "" {
@@ -114,6 +170,47 @@ func (m *Manager) initChild(containerSpec *oci.Spec, bundle string) error {
 
 	// Execute the container process
 	return m.execProcess(containerSpec.Process)
+}
+
+// createDevicesFromSpec creates device nodes from the OCI spec.
+func createDevicesFromSpec(devices []oci.LinuxDevice) error {
+	for _, dev := range devices {
+		if err := createDevice(dev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// createDevice creates a single device node.
+func createDevice(dev oci.LinuxDevice) error {
+	// Ensure parent directory exists
+	dir := filepath.Dir(dev.Path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create device dir %s: %w", dir, err)
+	}
+
+	// Determine device mode
+	var mode uint32 = 0666
+	if dev.FileMode != nil {
+		mode = *dev.FileMode
+	}
+
+	// Add device type to mode
+	switch dev.Type {
+	case "c", "u": // character device
+		mode |= 0020000 // S_IFCHR
+	case "b": // block device
+		mode |= 0060000 // S_IFBLK
+	case "p": // FIFO
+		mode |= 0010000 // S_IFIFO
+	default:
+		return fmt.Errorf("unknown device type: %s", dev.Type)
+	}
+
+	// Create the device using mknod
+	// This is handled in the Linux-specific code
+	return createDeviceNode(dev.Path, mode, dev.Major, dev.Minor, dev.UID, dev.GID)
 }
 
 // Run creates and starts a container in one operation.

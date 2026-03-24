@@ -102,10 +102,11 @@ All the magic happens in about 2000 lines of Go.
 membrane/
 ├── cmd/membrane/       CLI entry point
 ├── internal/
-│   ├── container/      Container lifecycle (create, start, kill)
-│   ├── namespace/      Linux namespace setup
+│   ├── capabilities/   Linux capability management
 │   ├── cgroup/         Cgroups v2 resource limits
-│   ├── filesystem/     Mount operations, pivot_root
+│   ├── container/      Container lifecycle (create, start, kill)
+│   ├── filesystem/     Mount operations, pivot_root, overlayfs
+│   ├── namespace/      Linux namespace setup
 │   ├── seccomp/        Syscall filtering
 │   ├── spec/           OCI spec parsing
 │   └── state/          Container state persistence
