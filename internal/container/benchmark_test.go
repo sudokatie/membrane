@@ -2,7 +2,9 @@ package container
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -206,4 +208,174 @@ func BenchmarkContainerList(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkContainerStartup benchmarks full container startup time.
+// This benchmark requires:
+// - Linux (for namespaces)
+// - Root privileges (for namespace creation)
+// - A functional rootfs with /bin/true
+//
+// Run with: sudo go test -bench=BenchmarkContainerStartup -run=^$ ./internal/container/
+func BenchmarkContainerStartup(b *testing.B) {
+	if runtime.GOOS != "linux" {
+		b.Skip("requires Linux")
+	}
+	if os.Getuid() != 0 {
+		b.Skip("requires root")
+	}
+
+	// Check if we have a usable busybox
+	busyboxPath, err := exec.LookPath("busybox")
+	if err != nil {
+		b.Skip("requires busybox in PATH")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "membrane-bench-startup-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create rootfs with busybox
+	bundleDir := filepath.Join(tmpDir, "bundle")
+	rootfsDir := filepath.Join(bundleDir, "rootfs", "bin")
+	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+		b.Fatal(err)
+	}
+
+	// Copy busybox
+	busyboxDest := filepath.Join(rootfsDir, "busybox")
+	input, err := os.ReadFile(busyboxPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(busyboxDest, input, 0755); err != nil {
+		b.Fatal(err)
+	}
+
+	// Create symlink for true
+	if err := os.Symlink("busybox", filepath.Join(rootfsDir, "true")); err != nil {
+		b.Fatal(err)
+	}
+
+	// Write config for a quick-exit container
+	configJSON := `{
+		"ociVersion": "1.0.2",
+		"root": {"path": "rootfs"},
+		"process": {
+			"args": ["/bin/true"],
+			"cwd": "/",
+			"env": ["PATH=/bin"]
+		},
+		"linux": {
+			"namespaces": [
+				{"type": "pid"},
+				{"type": "mount"},
+				{"type": "uts"},
+				{"type": "ipc"}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(configJSON), 0644); err != nil {
+		b.Fatal(err)
+	}
+
+	config := &Config{StateRoot: filepath.Join(tmpDir, "state")}
+	mgr := NewManager(config)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := "bench-startup-" + time.Now().Format("20060102150405.000000000")
+
+		// Create
+		_, err := mgr.Create(&CreateOptions{
+			ID:     id,
+			Bundle: bundleDir,
+		})
+		if err != nil {
+			b.Fatalf("create: %v", err)
+		}
+
+		// Start
+		err = mgr.Start(&StartOptions{ID: id})
+		if err != nil {
+			mgr.Delete(id, true)
+			b.Fatalf("start: %v", err)
+		}
+
+		// Wait for exit
+		_, err = mgr.Wait(id)
+		if err != nil {
+			mgr.Delete(id, true)
+			b.Fatalf("wait: %v", err)
+		}
+
+		// Clean up
+		mgr.Delete(id, true)
+	}
+}
+
+// BenchmarkContainerStartupParallel benchmarks parallel container startups.
+// Same requirements as BenchmarkContainerStartup.
+func BenchmarkContainerStartupParallel(b *testing.B) {
+	if runtime.GOOS != "linux" {
+		b.Skip("requires Linux")
+	}
+	if os.Getuid() != 0 {
+		b.Skip("requires root")
+	}
+
+	busyboxPath, err := exec.LookPath("busybox")
+	if err != nil {
+		b.Skip("requires busybox in PATH")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "membrane-bench-startup-parallel-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	bundleDir := filepath.Join(tmpDir, "bundle")
+	rootfsDir := filepath.Join(bundleDir, "rootfs", "bin")
+	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+		b.Fatal(err)
+	}
+
+	busyboxDest := filepath.Join(rootfsDir, "busybox")
+	input, err := os.ReadFile(busyboxPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(busyboxDest, input, 0755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Symlink("busybox", filepath.Join(rootfsDir, "true")); err != nil {
+		b.Fatal(err)
+	}
+
+	configJSON := `{
+		"ociVersion": "1.0.2",
+		"root": {"path": "rootfs"},
+		"process": {"args": ["/bin/true"], "cwd": "/", "env": ["PATH=/bin"]},
+		"linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}]}
+	}`
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(configJSON), 0644); err != nil {
+		b.Fatal(err)
+	}
+
+	config := &Config{StateRoot: filepath.Join(tmpDir, "state")}
+	mgr := NewManager(config)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := "bench-parallel-" + time.Now().Format("20060102150405.000000000")
+			mgr.Create(&CreateOptions{ID: id, Bundle: bundleDir})
+			mgr.Start(&StartOptions{ID: id})
+			mgr.Wait(id)
+			mgr.Delete(id, true)
+		}
+	})
 }
