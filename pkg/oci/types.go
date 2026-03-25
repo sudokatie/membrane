@@ -13,10 +13,48 @@ type Spec struct {
 	Hostname string `json:"hostname,omitempty"`
 	// Mounts are filesystem mounts.
 	Mounts []Mount `json:"mounts,omitempty"`
+	// Hooks are lifecycle hooks.
+	Hooks *Hooks `json:"hooks,omitempty"`
 	// Linux contains Linux-specific configuration.
 	Linux *Linux `json:"linux,omitempty"`
 	// Annotations are arbitrary metadata.
 	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+// Hooks contains lifecycle hooks for the container.
+type Hooks struct {
+	// Prestart is called after the start operation is called but before
+	// the user-specified program has been executed.
+	// Deprecated: use CreateRuntime, CreateContainer, and StartContainer instead.
+	Prestart []Hook `json:"prestart,omitempty"`
+	// CreateRuntime is called during the create operation after the runtime
+	// environment has been created but before the pivot_root has been executed.
+	CreateRuntime []Hook `json:"createRuntime,omitempty"`
+	// CreateContainer is called during the create operation after the runtime
+	// environment has been created and after the pivot_root has been executed
+	// but before the user-specified program has executed.
+	CreateContainer []Hook `json:"createContainer,omitempty"`
+	// StartContainer is called before executing the user-specified process
+	// inside the container.
+	StartContainer []Hook `json:"startContainer,omitempty"`
+	// Poststart is called after the user-specified process is executed but
+	// before the start operation returns.
+	Poststart []Hook `json:"poststart,omitempty"`
+	// Poststop is called after the container is deleted but before the delete
+	// operation returns.
+	Poststop []Hook `json:"poststop,omitempty"`
+}
+
+// Hook specifies a command to run at a particular point in the lifecycle.
+type Hook struct {
+	// Path is the absolute path to the hook binary.
+	Path string `json:"path"`
+	// Args are arguments to pass to the hook binary.
+	Args []string `json:"args,omitempty"`
+	// Env is environment variables for the hook.
+	Env []string `json:"env,omitempty"`
+	// Timeout is the number of seconds before the hook times out.
+	Timeout *int `json:"timeout,omitempty"`
 }
 
 // Root is the root filesystem configuration.

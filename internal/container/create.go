@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/sudokatie/membrane/internal/cgroup"
+	"github.com/sudokatie/membrane/internal/hooks"
+	"github.com/sudokatie/membrane/internal/log"
 	"github.com/sudokatie/membrane/internal/spec"
 	"github.com/sudokatie/membrane/internal/state"
 	"github.com/sudokatie/membrane/pkg/oci"
@@ -34,6 +36,9 @@ type CreateOptions struct {
 
 // Create creates a new container from a bundle.
 func (m *Manager) Create(opts *CreateOptions) (*Container, error) {
+	logger := log.WithField("container", opts.ID)
+	logger.Debug("creating container")
+
 	// Validate ID
 	if opts.ID == "" {
 		return nil, ErrInvalidID
@@ -96,14 +101,13 @@ func (m *Manager) Create(opts *CreateOptions) (*Container, error) {
 	}
 	cgroupMgr := cgroup.NewV2Manager(cgroupConfig)
 	if err := cgroupMgr.Create(); err != nil {
-		// Log but don't fail - cgroups may not be available
-		// (e.g., running in a container without cgroup access)
+		logger.Warnf("cgroup create failed (may be unavailable): %v", err)
 	}
 
 	// Apply resource limits
 	if cgroupConfig.Resources != nil {
 		if err := cgroupMgr.SetResources(cgroupConfig.Resources); err != nil {
-			// Non-fatal
+			logger.Warnf("set cgroup resources failed: %v", err)
 		}
 	}
 
@@ -125,6 +129,7 @@ func (m *Manager) Create(opts *CreateOptions) (*Container, error) {
 		return nil, fmt.Errorf("save state: %w", err)
 	}
 
+	logger.Info("container created")
 	return &Container{
 		ID:     opts.ID,
 		Bundle: bundle,
@@ -135,6 +140,9 @@ func (m *Manager) Create(opts *CreateOptions) (*Container, error) {
 
 // Delete deletes a container.
 func (m *Manager) Delete(id string, force bool) error {
+	logger := log.WithField("container", id)
+	logger.Debug("deleting container")
+
 	// Load state
 	st, err := m.store.Load(id)
 	if err != nil {
@@ -146,11 +154,30 @@ func (m *Manager) Delete(id string, force bool) error {
 		return fmt.Errorf("cannot delete container in %s state", st.Status)
 	}
 
+	// Load spec for hooks
+	containerSpec, specErr := spec.LoadSpec(st.Bundle)
+
+	// Run poststop hooks
+	if specErr == nil && containerSpec.Hooks != nil {
+		hookState := &hooks.HookState{
+			OCIVersion:  containerSpec.Version,
+			ID:          id,
+			Status:      st.Status,
+			Pid:         st.Pid,
+			Bundle:      st.Bundle,
+			Annotations: st.Annotations,
+		}
+		if err := hooks.RunPoststop(containerSpec.Hooks, hookState); err != nil {
+			logger.Warnf("poststop hooks failed: %v", err)
+			// Non-fatal - continue with delete
+		}
+	}
+
 	// Clean up cgroup
 	cgroupConfig := cgroup.DefaultConfig(id)
 	cgroupMgr := cgroup.NewV2Manager(cgroupConfig)
 	if err := cgroupMgr.Delete(); err != nil {
-		// Log but continue - cgroup may not exist or may have been cleaned up
+		logger.Debugf("cgroup delete failed (may not exist): %v", err)
 	}
 
 	// Delete state
@@ -158,5 +185,6 @@ func (m *Manager) Delete(id string, force bool) error {
 		return fmt.Errorf("delete state: %w", err)
 	}
 
+	logger.Info("container deleted")
 	return nil
 }

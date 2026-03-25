@@ -180,6 +180,7 @@ func DefaultSpec() *oci.Spec {
 				{Type: oci.IPCNamespace},
 				{Type: oci.UTSNamespace},
 				{Type: oci.NetworkNamespace},
+				{Type: oci.CgroupNamespace},
 			},
 			MaskedPaths:   oci.DefaultMaskedPaths,
 			ReadonlyPaths: oci.DefaultReadonlyPaths,

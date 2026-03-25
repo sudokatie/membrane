@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/sudokatie/membrane/internal/capabilities"
 	"github.com/sudokatie/membrane/internal/cgroup"
 	"github.com/sudokatie/membrane/internal/filesystem"
+	"github.com/sudokatie/membrane/internal/hooks"
+	"github.com/sudokatie/membrane/internal/log"
 	"github.com/sudokatie/membrane/internal/namespace"
 	"github.com/sudokatie/membrane/internal/seccomp"
 	"github.com/sudokatie/membrane/internal/spec"
@@ -23,6 +26,9 @@ type StartOptions struct {
 
 // Start starts a created container.
 func (m *Manager) Start(opts *StartOptions) error {
+	logger := log.WithField("container", opts.ID)
+	logger.Debug("starting container")
+
 	// Load state
 	st, err := m.store.Load(opts.ID)
 	if err != nil {
@@ -40,6 +46,20 @@ func (m *Manager) Start(opts *StartOptions) error {
 		return fmt.Errorf("load spec: %w", err)
 	}
 
+	// Create hook state for lifecycle hooks
+	hookState := &hooks.HookState{
+		OCIVersion:  containerSpec.Version,
+		ID:          opts.ID,
+		Status:      st.Status,
+		Bundle:      st.Bundle,
+		Annotations: st.Annotations,
+	}
+
+	// Run createRuntime hooks (before environment setup)
+	if err := hooks.RunCreateRuntime(containerSpec.Hooks, hookState); err != nil {
+		return fmt.Errorf("createRuntime hooks: %w", err)
+	}
+
 	// Set up cgroup
 	cgroupConfig := cgroup.DefaultConfig(opts.ID)
 	if containerSpec.Linux != nil && containerSpec.Linux.Resources != nil {
@@ -47,7 +67,7 @@ func (m *Manager) Start(opts *StartOptions) error {
 	}
 	cgroupMgr := cgroup.NewV2Manager(cgroupConfig)
 	if err := cgroupMgr.Create(); err != nil {
-		// Non-fatal on non-Linux
+		logger.Warnf("cgroup create failed (may be unavailable): %v", err)
 	}
 
 	// Set up namespace config
@@ -57,30 +77,38 @@ func (m *Manager) Start(opts *StartOptions) error {
 	}
 	nsConfig.SortForClone()
 
+	// Check if user namespace is enabled
+	hasUserNS := nsConfig.HasUserNamespace()
+
 	// Set up terminal if requested
 	var terminal *Terminal
+	var terminalMu sync.Mutex
 	if containerSpec.Process != nil && containerSpec.Process.Terminal {
 		var err error
 		terminal, err = NewTerminal()
 		if err != nil {
 			return fmt.Errorf("create terminal: %w", err)
 		}
-		defer func() {
-			if terminal != nil {
-				terminal.Close()
-			}
-		}()
+		// Terminal cleanup handled after process exits, not in defer
 	}
 
 	// Fork child process
+	logger.Debug("forking child process")
 	pid, err := namespace.CloneChild(nsConfig)
 	if err != nil {
+		if terminal != nil {
+			terminal.Close()
+		}
 		return fmt.Errorf("clone: %w", err)
 	}
 
 	if pid == 0 {
 		// In child process
-		if err := m.initChild(containerSpec, st.Bundle, terminal); err != nil {
+		terminalMu.Lock()
+		childTerminal := terminal
+		terminalMu.Unlock()
+
+		if err := m.initChild(containerSpec, st.Bundle, childTerminal, hookState); err != nil {
 			fmt.Fprintf(os.Stderr, "init error: %v\n", err)
 			os.Exit(1)
 		}
@@ -89,10 +117,37 @@ func (m *Manager) Start(opts *StartOptions) error {
 	}
 
 	// In parent process
+	logger.WithField("pid", pid).Debug("child process started")
+
+	// Write UID/GID mappings for user namespace
+	if hasUserNS && containerSpec.Linux != nil {
+		if len(containerSpec.Linux.UIDMappings) > 0 {
+			logger.Debug("writing UID mappings")
+			if err := namespace.WriteUIDMapping(pid, containerSpec.Linux.UIDMappings); err != nil {
+				logger.Warnf("write UID mapping failed: %v", err)
+			}
+		}
+		if len(containerSpec.Linux.GIDMappings) > 0 {
+			logger.Debug("writing GID mappings")
+			if err := namespace.WriteGIDMapping(pid, containerSpec.Linux.GIDMappings); err != nil {
+				logger.Warnf("write GID mapping failed: %v", err)
+			}
+		}
+	}
 
 	// Add child to cgroup
 	if err := cgroupMgr.AddProcess(pid); err != nil {
-		// Non-fatal
+		logger.Warnf("add process to cgroup failed: %v", err)
+	}
+
+	// Update hook state with PID
+	hookState.Pid = pid
+	hookState.Status = state.StatusRunning
+
+	// Run poststart hooks
+	if err := hooks.RunPoststart(containerSpec.Hooks, hookState); err != nil {
+		logger.Warnf("poststart hooks failed: %v", err)
+		// Non-fatal per OCI spec
 	}
 
 	// Update state
@@ -102,11 +157,17 @@ func (m *Manager) Start(opts *StartOptions) error {
 		return fmt.Errorf("save state: %w", err)
 	}
 
+	logger.Info("container started")
 	return nil
 }
 
 // initChild runs in the child process after fork.
-func (m *Manager) initChild(containerSpec *oci.Spec, bundle string, terminal *Terminal) error {
+func (m *Manager) initChild(containerSpec *oci.Spec, bundle string, terminal *Terminal, hookState *hooks.HookState) error {
+	// Close extra file descriptors to prevent leaks
+	if err := closeExtraFDs(); err != nil {
+		log.Warnf("close extra FDs failed: %v", err)
+	}
+
 	// Set up terminal if provided
 	if terminal != nil {
 		if err := terminal.SetupChildTerminal(); err != nil {
@@ -144,6 +205,11 @@ func (m *Manager) initChild(containerSpec *oci.Spec, bundle string, terminal *Te
 	// Set up filesystem and pivot_root
 	if err := filesystem.SetupRootfs(rootfs, mounts); err != nil {
 		return fmt.Errorf("setup rootfs: %w", err)
+	}
+
+	// Run createContainer hooks (after pivot_root, before user process)
+	if err := hooks.RunCreateContainer(containerSpec.Hooks, hookState); err != nil {
+		return fmt.Errorf("createContainer hooks: %w", err)
 	}
 
 	// Apply root readonly if specified
@@ -210,18 +276,28 @@ func (m *Manager) initChild(containerSpec *oci.Spec, bundle string, terminal *Te
 		}
 	}
 
+	// Change to working directory
+	if containerSpec.Process != nil && containerSpec.Process.Cwd != "" {
+		if err := os.Chdir(containerSpec.Process.Cwd); err != nil {
+			return fmt.Errorf("chdir: %w", err)
+		}
+	}
+
+	// Run startContainer hooks (just before exec)
+	if err := hooks.RunStartContainer(containerSpec.Hooks, hookState); err != nil {
+		return fmt.Errorf("startContainer hooks: %w", err)
+	}
+
+	// Run prestart hooks (deprecated but still supported)
+	if err := hooks.RunPrestart(containerSpec.Hooks, hookState); err != nil {
+		return fmt.Errorf("prestart hooks: %w", err)
+	}
+
 	// Apply seccomp filter (must be last before exec)
 	if containerSpec.Linux != nil && containerSpec.Linux.Seccomp != nil {
 		profile := seccomp.FromSpec(containerSpec.Linux.Seccomp)
 		if err := seccomp.LoadFilter(profile); err != nil {
 			return fmt.Errorf("load seccomp filter: %w", err)
-		}
-	}
-
-	// Change to working directory
-	if containerSpec.Process != nil && containerSpec.Process.Cwd != "" {
-		if err := os.Chdir(containerSpec.Process.Cwd); err != nil {
-			return fmt.Errorf("chdir: %w", err)
 		}
 	}
 

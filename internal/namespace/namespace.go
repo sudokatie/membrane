@@ -128,6 +128,7 @@ func DefaultConfig() *Config {
 			{Type: oci.IPCNamespace},
 			{Type: oci.UTSNamespace},
 			{Type: oci.NetworkNamespace},
+			{Type: oci.CgroupNamespace},
 		},
 	}
 }

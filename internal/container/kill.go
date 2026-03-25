@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/sudokatie/membrane/internal/log"
 	"github.com/sudokatie/membrane/internal/state"
 	"github.com/sudokatie/membrane/pkg/oci"
 )
@@ -22,6 +23,8 @@ type KillOptions struct {
 
 // Kill sends a signal to the container's init process.
 func (m *Manager) Kill(opts *KillOptions) error {
+	logger := log.WithField("container", opts.ID)
+
 	// Load state
 	st, err := m.store.Load(opts.ID)
 	if err != nil {
@@ -48,6 +51,8 @@ func (m *Manager) Kill(opts *KillOptions) error {
 		}
 	}
 
+	logger.WithField("signal", sig).Debug("sending signal to container")
+
 	// Find process
 	proc, err := os.FindProcess(st.Pid)
 	if err != nil {
@@ -58,6 +63,7 @@ func (m *Manager) Kill(opts *KillOptions) error {
 	if err := proc.Signal(sig); err != nil {
 		// Process may have already exited
 		if err == os.ErrProcessDone {
+			logger.Debug("process already exited")
 			// Update state to stopped
 			st.Status = state.StatusStopped
 			st.Pid = 0
@@ -67,19 +73,31 @@ func (m *Manager) Kill(opts *KillOptions) error {
 		return fmt.Errorf("send signal: %w", err)
 	}
 
+	logger.Info("signal sent to container")
 	return nil
 }
 
 // Wait waits for a container to exit and returns the exit code.
 func (m *Manager) Wait(id string) (int, error) {
+	logger := log.WithField("container", id)
+	logger.Debug("waiting for container to exit")
+
 	// Load state
 	st, err := m.store.Load(id)
 	if err != nil {
 		return -1, err
 	}
 
+	// If already stopped, return cached exit code
+	if st.IsStopped() {
+		if st.ExitCode != nil {
+			return *st.ExitCode, nil
+		}
+		return 0, nil
+	}
+
 	if !st.IsRunning() {
-		return 0, nil // Already stopped
+		return 0, nil // Not running, not stopped - assume success
 	}
 
 	// Wait for the process
@@ -91,20 +109,28 @@ func (m *Manager) Wait(id string) (int, error) {
 	ps, err := proc.Wait()
 	if err != nil {
 		// Process may have been reaped by someone else
+		logger.Debugf("wait failed (process may have been reaped): %v", err)
 		st.Status = state.StatusStopped
 		st.Pid = 0
+		exitCode := -1
+		st.ExitCode = &exitCode
 		m.store.Save(st)
 		return -1, nil
 	}
 
+	// Get exit code
+	exitCode := ps.ExitCode()
+	logger.WithField("exitCode", exitCode).Debug("container exited")
+
 	// Update state
 	st.Status = state.StatusStopped
 	st.Pid = 0
+	st.ExitCode = &exitCode
 	if err := m.store.Save(st); err != nil {
-		return -1, fmt.Errorf("save state: %w", err)
+		return exitCode, fmt.Errorf("save state: %w", err)
 	}
 
-	return ps.ExitCode(), nil
+	return exitCode, nil
 }
 
 // State returns the current state of a container.

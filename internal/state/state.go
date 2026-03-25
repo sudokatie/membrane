@@ -39,6 +39,9 @@ type State struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 	// Created is the creation timestamp.
 	Created time.Time `json:"created,omitempty"`
+	// ExitCode is the exit code of the container's init process.
+	// Only valid when Status is StatusStopped.
+	ExitCode *int `json:"exitCode,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler.
